@@ -1,4 +1,3 @@
-cat > ~/mail_bot_final.py << 'EOF'
 #!/usr/bin/env python3
 import requests
 import time
@@ -9,7 +8,7 @@ from datetime import datetime, date
 
 # ===== ТВОИ ДАННЫЕ =====
 BOT_TOKEN = "8587539177:AAEvuEtb8u77cWJdtpIY-mzjXOMk-FHUgSQ"
-ADMIN_ID = "8195563239"  # ТВОЙ Telegram ID - ТЫ АДМИН!
+ADMIN_ID = "8195563239"
 ADMIN_USERNAME = "nodokc"
 # =======================
 
@@ -17,11 +16,10 @@ API = "https://api.mail.tm"
 session = requests.Session()
 session.verify = False
 
-# Файлы
-VIP_FILE = "/sdcard/mail_vip_users.json"
-MAIL_FILE = "/sdcard/mail_users_data.json"
-STATS_FILE = "/sdcard/mail_stats.json"
-PROCESSED_FILE = "/sdcard/processed_ids.txt"
+VIP_FILE = "vip_users.json"
+MAIL_FILE = "users_data.json"
+STATS_FILE = "stats.json"
+PROCESSED_FILE = "processed_ids.txt"
 
 def load_vip():
     if os.path.exists(VIP_FILE):
@@ -391,7 +389,6 @@ def handle_command(user_id, cmd, args):
         count = delete_all_messages(mail_data['token'])
         return f"🗑️ Удалено {count} писем"
     
-    # АДМИН КОМАНДЫ (только ты)
     elif cmd == "/admin" and is_admin(user_id):
         return ("👑 <b>АДМИН ПАНЕЛЬ</b>\n\n"
                "/stats - Статистика\n"
@@ -440,8 +437,7 @@ def handle_command(user_id, cmd, args):
 
 def main():
     print("🤖 БОТ ЗАПУЩЕН!")
-    print(f"👑 Твой ID: {ADMIN_ID} - ТЫ АДМИН!")
-    print("✅ Двойной ответ исправлен")
+    print(f"👑 Админ ID: {ADMIN_ID}")
     
     last_update_id = 0
     processed_ids = load_processed()
@@ -449,33 +445,24 @@ def main():
     while True:
         try:
             updates = get_updates(last_update_id + 1 if last_update_id else None)
-            
             for update in updates:
                 update_id = update['update_id']
-                
-                # Пропускаем уже обработанные
                 if str(update_id) in processed_ids:
                     continue
-                
                 processed_ids.add(str(update_id))
                 save_processed(update_id)
                 last_update_id = update_id
-                
                 if 'message' in update:
                     msg = update['message']
                     user_id = str(msg['from']['id'])
                     text = msg.get('text', '')
-                    
                     if text:
                         parts = text.split()
                         cmd = parts[0].lower()
                         args = parts[1:] if len(parts) > 1 else []
-                        
-                        print(f"📨 {user_id}: {cmd}")
                         response = handle_command(user_id, cmd, args)
                         if response:
                             send_telegram(user_id, response)
-            
             time.sleep(1)
         except Exception as e:
             print(f"Ошибка: {e}")
@@ -483,5 +470,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF
-python ~/mail_bot_final.py
