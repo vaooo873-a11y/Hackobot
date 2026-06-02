@@ -1,472 +1,267 @@
-#!/usr/bin/env python3
+import asyncio
+import logging
+import sys
 import requests
-import time
-import re
-import json
-import os
-from datetime import datetime, date
+from datetime import datetime, timedelta
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
+# --- НАСТРОЙКИ ---
+TELEGRAM_TOKEN = '8254126250:AAHeMHAs_zyW9D0ZrNM0LHE6AXvAW2czfXM'
+OLLAMA_MODEL = 'gemma4:31b-cloud' 
+OLLAMA_URL = 'http://127.0.0.1:11434/api/chat'
+ADMIN_USERNAME = '@nodokc' 
+# -----------------
 
-# ===== ТВОИ ДАННЫЕ =====
-BOT_TOKEN = "8587539177:AAEvuEtb8u77cWJdtpIY-mzjXOMk-FHUgSQ"
-ADMIN_ID = "8195563239"
-ADMIN_USERNAME = "nodokc"
-# =======================
+SYSTEM_PROMPT = """A plane crashed into a snow forest... (вставь сюда весь полный промпт с русского языка) ..."""
 
-API = "https://api.mail.tm"
-session = requests.Session()
-session.verify = False
+users_db = {}
 
-VIP_FILE = "vip_users.json"
-MAIL_FILE = "users_data.json"
-STATS_FILE = "stats.json"
-PROCESSED_FILE = "processed_ids.txt"
+logging.basicConfig(level=logging.INFO)
 
-def load_vip():
-    if os.path.exists(VIP_FILE):
-        with open(VIP_FILE, 'r') as f:
-            return json.load(f)
-    return {}
+def get_keyboard():
+    keyboard = [
+        [KeyboardButton("🎭 Режим Выживших: ВКЛ"), KeyboardButton("🤖 Обычный режим: ВКЛ")],
+        [KeyboardButton("💎 Подписки"), KeyboardButton("🆓 Получить Test")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-def save_vip(vip):
-    with open(VIP_FILE, 'w') as f:
-        json.dump(vip, f)
-
-def load_mails():
-    if os.path.exists(MAIL_FILE):
-        with open(MAIL_FILE, 'r') as f:
-            return json.load(f)
-    return {}
-
-def save_mails(mails):
-    with open(MAIL_FILE, 'w') as f:
-        json.dump(mails, f)
-
-def load_stats():
-    if os.path.exists(STATS_FILE):
-        with open(STATS_FILE, 'r') as f:
-            return json.load(f)
-    return {}
-
-def save_stats(stats):
-    with open(STATS_FILE, 'w') as f:
-        json.dump(stats, f)
-
-def load_processed():
-    if os.path.exists(PROCESSED_FILE):
-        with open(PROCESSED_FILE, 'r') as f:
-            return set(f.read().splitlines())
-    return set()
-
-def save_processed(processed_id):
-    with open(PROCESSED_FILE, 'a') as f:
-        f.write(str(processed_id) + '\n')
-
-def is_vip(user_id):
-    vip = load_vip()
-    user_id_str = str(user_id)
-    if user_id_str in vip:
-        expiry = vip[user_id_str].get('expiry')
-        if expiry and expiry > time.time():
-            return True
-        elif expiry:
-            del vip[user_id_str]
-            save_vip(vip)
-            return False
-    return False
-
-def check_limit(user_id):
-    if is_vip(user_id):
-        return True, 999999
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.username
     
-    stats = load_stats()
-    user_id_str = str(user_id)
-    today = str(date.today())
-    
-    if user_id_str not in stats:
-        stats[user_id_str] = {'last_date': today, 'count': 0}
-        save_stats(stats)
-    
-    if stats[user_id_str]['last_date'] != today:
-        stats[user_id_str] = {'last_date': today, 'count': 0}
-        save_stats(stats)
-    
-    count = stats[user_id_str]['count']
-    if count >= 2:
-        return False, 0
-    return True, 2 - count
+    if user_id not in users_db:
+        status = 'admin' if f"@{username}" == ADMIN_USERNAME else 'user'
+        users_db[user_id] = {
+            'status': status, 'history': [], 'requests_ai': 5, 
+            'requests_surv': 0, 'ban_until': None, 
+            'subscription_until': None, 'username': f"@{username}" if username else "Unknown", 
+            'mode': 'normal'
+        }
 
-def increment_usage(user_id):
-    if is_vip(user_id):
+    await update.message.reply_text(
+        f"Привет! Твой статус: {users_db[user_id]['status'].upper()}\nКоманды: /list",
+        reply_markup=get_keyboard()
+    )
+
+# --- АДМИНСКИЕ КОМАНДЫ ---
+async def set_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if users_db.get(user_id, {}).get('status') != 'admin': return
+    if not context.args: return
+    target_user = context.args[0].lower()
+    for uid, data in users_db.items():
+        if data['username'].lower() == target_user:
+            data['status'] = 'admin'
+            await update.message.reply_text(f"✅ {target_user} теперь АДМИН!")
+            return
+    await update.message.reply_text("Юзер не найден.")
+
+async def set_vip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if users_db.get(user_id, {}).get('status') != 'admin': return
+    if not context.args: return
+    target_user = context.args[0].lower()
+    for uid, data in users_db.items():
+        if data['username'].lower() == target_user:
+            data['status'] = 'vip'
+            data['requests_surv'] = 10
+            await update.message.reply_text(f"✅ {target_user} теперь VIP!")
+            return
+    await update.message.reply_text("Юзер не найден.")
+
+async def set_god(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if users_db.get(user_id, {}).get('status') != 'admin': return
+    if not context.args: return
+    target_user = context.args[0].lower()
+    for uid, data in users_db.items():
+        if data['username'].lower() == target_user:
+            data['status'] = 'god'
+            data['requests_surv'] = 50
+            await update.message.reply_text(f"✅ {target_user} теперь GOD!")
+            return
+    await update.message.reply_text("Юзер не найден.")
+
+async def delete_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if users_db.get(user_id, {}).get('status') != 'admin': return
+    if not context.args: return
+    target_user = context.args[0].lower()
+    for uid, data in users_db.items():
+        if data['username'].lower() == target_user:
+            data['status'] = 'user'
+            await update.message.reply_text(f"🗑 {target_user} лишен подписки и стал обычным юзером.")
+            return
+    await update.message.reply_text("Юзер не найден.")
+
+async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if users_db.get(user_id, {}).get('status') != 'admin': return
+    if len(context.args) < 2: return
+    time_str, target_user = context.args[0], context.args[1].lower()
+    ban_time = None
+    if time_str == '1h': ban_time = datetime.now() + timedelta(hours=1)
+    elif time_str == '1d': ban_time = datetime.now() + timedelta(days=1)
+    elif time_str == 'ip': ban_time = datetime.now() + timedelta(days=36500)
+    else: return
+    for uid, data in users_db.items():
+        if data['username'].lower() == target_user:
+            data['ban_until'] = ban_time
+            await update.message.reply_text(f"🚫 {target_user} забанен до {ban_time}")
+            return
+
+async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if users_db.get(user_id, {}).get('status') != 'admin': return
+    if not context.args: return
+    target_user = context.args[0].lower()
+    for uid, data in users_db.items():
+        if data['username'].lower() == target_user:
+            data['ban_until'] = None
+            await update.message.reply_text(f"✅ {target_user} разбанен!")
+            return
+
+async def give_reqs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if users_db.get(user_id, {}).get('status') != 'admin': return
+    if not context.args: return
+    target_user = context.args[0].lower()
+    for uid, data in users_db.items():
+        if data['username'].lower() == target_user:
+            data['requests_ai'] += 50
+            await update.message.reply_text(f"🎁 {target_user} получил +50 обычных запросов!")
+            return
+
+async def gives_reqs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if users_db.get(user_id, {}).get('status') != 'admin': return
+    if not context.args: return
+    target_user = context.args[0].lower()
+    for uid, data in users_db.items():
+        if data['username'].lower() == target_user:
+            data['requests_surv'] += 50
+            await update.message.reply_text(f"🔥 {target_user} получил +50 запросов выживания!")
+            return
+
+async def list_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📜 **СПИСОК КОМАНД**\n\n"
+        "👤 **Для всех:**\n"
+        "/start - Запуск\n"
+        "/list - Список команд\n\n"
+        "👑 **Для Администратора:**\n"
+        "/setadmin @user - Выдать админку\n"
+        "/setvip @user - Выдать VIP\n"
+        "/setgod @user - Выдать GOD\n"
+        "/delete @user - Забрать подписку\n"
+        "/ban [1h/1d/ip] @user - Бан\n"
+        "/unban @user - Разбан\n"
+        "/give @user - +50 обычных запросов\n"
+        "/gives @user - +50 запросов выживания"
+    )
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+    if user_id not in users_db: return
+    user_data = users_db[user_id]
+
+    if user_data['ban_until'] and datetime.now() < user_data['ban_until']:
+        await update.message.reply_text(f"🚫 Вы забанены до {user_data['ban_until']}")
         return
-    stats = load_stats()
-    user_id_str = str(user_id)
-    today = str(date.today())
-    if user_id_str not in stats or stats[user_id_str]['last_date'] != today:
-        stats[user_id_str] = {'last_date': today, 'count': 0}
-    stats[user_id_str]['count'] += 1
-    save_stats(stats)
 
-def get_remaining(user_id):
-    if is_vip(user_id):
-        return "∞ (VIP)"
-    stats = load_stats()
-    user_id_str = str(user_id)
-    today = str(date.today())
-    if user_id_str not in stats or stats[user_id_str]['last_date'] != today:
-        return 2
-    used = stats[user_id_str]['count']
-    return max(0, 2 - used)
+    if text == "🎭 Режим Выживших: ВКЛ":
+        if user_data['status'] == 'user':
+            await update.message.reply_text("❌ Режим выживания запрещен для обычных юзеров! Купи VIP или GOD.")
+            return
+        user_data['mode'] = 'roleplay'
+        await update.message.reply_text("✅ Режим Выживших: ВКЛ")
+        return
+    elif text == "🤖 Обычный режим: ВКЛ":
+        user_data['mode'] = 'normal'
+        await update.message.reply_text("✅ Обычный режим: ВКЛ")
+        return
+    elif text == "💎 Подписки":
+        subs_text = (
+            "💎 **ПОДПИСКИ**\n\n"
+            "🆓 **Test** - 1д бесплатно, 50 запр. (Обычный)\n"
+            "🌟 **VIP (20р)** - 30д, 100 запр/день + 10 запр. Выживание\n"
+            "⚡ **GOD (50р)** - Безлим обычный + 50 запр. Выживание/день\n\n"
+            "👉 Пиши @nodokc"
+        )
+        await update.message.reply_text(subs_text, parse_mode='Markdown')
+        return
+    elif text == "🆓 Получить Test":
+        user_data['status'] = 'user'
+        user_data['requests_ai'] = 50
+        await update.message.reply_text("✅ Тестовый период активирован! Тебе начислено 50 обычных запросов. Режим выживания недоступен.")
+        return
 
-def send_telegram(chat_id, text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    # Логика лимитов
+    status = user_data['status']
+    mode = user_data.get('mode', 'normal')
+
+    if mode == 'roleplay':
+        if status == 'user':
+            await update.message.reply_text("❌ Режим выживания запрещен для обычных юзеров!")
+            return
+        elif status == 'vip':
+            if user_data['requests_surv'] <= 0:
+                await update.message.reply_text("❌ Лимит Выживания исчерпан (10/день).")
+                return
+            user_data['requests_surv'] -= 1
+        elif status == 'god':
+            if user_data['requests_surv'] <= 0: user_data['requests_surv'] = 50
+            user_data['requests_surv'] -= 1
+    else:
+        if status == 'user':
+            if user_data['requests_ai'] <= 0:
+                await update.message.reply_text("❌ Запросы закончились! Купи подписку у @nodokc.")
+                return
+            user_data['requests_ai'] -= 1
+        elif status == 'vip':
+            if user_data['requests_ai'] <= 0:
+                await update.message.reply_text("❌ Лимит 100 запросов исчерпан.")
+                return
+            user_data['requests_ai'] -= 1
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    messages = []
+    if mode == 'roleplay':
+        messages.append({"role": "system", "content": SYSTEM_PROMPT})
+    else:
+        messages.append({"role": "system", "content": "You are a helpful AI assistant. Answer in Russian."})
+
+    messages.extend(user_data['history'])
+    user_msg = f"Village: {text}" if mode == 'roleplay' else text
+    messages.append({"role": "user", "content": user_msg})
+
     try:
-        requests.post(url, json=data, timeout=10)
+        response = requests.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "messages": messages, "stream": False}, timeout=120)
+        if response.status_code == 200:
+            answer = response.json().get('message', {}).get('content', 'Ошибка.')
+            user_data['history'].append({"role": "user", "content": user_msg})
+            user_data['history'].append({"role": "assistant", "content": answer})
+            if len(user_data['history']) > 20: user_data['history'] = user_data['history'][-20:]
+            await update.message.reply_text(answer)
+        else:
+            await update.message.reply_text(f"Ошибка сервера: {response.status_code}")
     except Exception as e:
-        print(f"Ошибка: {e}")
+        await update.message.reply_text(f"Критическая ошибка: {str(e)}")
 
-def get_updates(offset=None):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    params = {"timeout": 30}
-    if offset:
-        params["offset"] = offset
-    try:
-        resp = requests.get(url, params=params, timeout=35)
-        return resp.json().get("result", [])
-    except:
-        return []
-
-def create_account(user_id):
-    try:
-        resp = session.get(f"{API}/domains")
-        domains = resp.json()['hydra:member']
-        domain = domains[0]['domain']
-        import random
-        name = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=10))
-        email = f"{name}@{domain}"
-        password = "pass" + ''.join(random.choices('0123456789', k=6))
-        resp = session.post(f"{API}/accounts", json={"address": email, "password": password})
-        if resp.status_code != 201:
-            return None, None, None
-        resp = session.post(f"{API}/token", json={"address": email, "password": password})
-        token = resp.json().get('token')
-        mails = load_mails()
-        mails[str(user_id)] = {'email': email, 'password': password, 'token': token}
-        save_mails(mails)
-        return email, password, token
-    except:
-        return None, None, None
-
-def get_user_mail(user_id):
-    mails = load_mails()
-    return mails.get(str(user_id))
-
-def login_to_mail(user_id, email, password):
-    try:
-        resp = session.post(f"{API}/token", json={"address": email, "password": password})
-        if resp.status_code != 200:
-            return None
-        token = resp.json().get('token')
-        mails = load_mails()
-        mails[str(user_id)] = {'email': email, 'password': password, 'token': token}
-        save_mails(mails)
-        return token
-    except:
-        return None
-
-def get_messages(token):
-    if not token:
-        return []
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        resp = session.get(f"{API}/messages?page=1&itemsPerPage=50", headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return []
-        return resp.json().get('hydra:member', [])
-    except:
-        return []
-
-def read_message(token, msg_id):
-    if not token:
-        return None
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        resp = session.get(f"{API}/messages/{msg_id}", headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return None
-        return resp.json()
-    except:
-        return None
-
-def extract_codes(text):
-    if not text or not isinstance(text, str):
-        return []
-    codes = re.findall(r'\b\d{4,8}\b', text)
-    alnum = re.findall(r'\b[A-Z0-9]{4,10}\b', text)
-    return list(set(codes + alnum))
-
-def delete_all_messages(token):
-    if not token:
-        return 0
-    headers = {"Authorization": f"Bearer {token}"}
-    messages = get_messages(token)
-    count = 0
-    for msg in messages:
-        try:
-            resp = session.delete(f"{API}/messages/{msg['id']}", headers=headers)
-            if resp.status_code == 204:
-                count += 1
-        except:
-            pass
-    return count
-
-def is_admin(user_id):
-    return str(user_id) == ADMIN_ID
-
-def give_vip(user_id, days=30):
-    vip = load_vip()
-    user_id_str = str(user_id)
-    expiry = time.time() + (days * 86400)
-    vip[user_id_str] = {'expiry': expiry, 'granted_by': ADMIN_ID, 'date': str(date.today())}
-    save_vip(vip)
-    return f"✅ VIP статус выдан на {days} дней!"
-
-def remove_vip(user_id):
-    vip = load_vip()
-    user_id_str = str(user_id)
-    if user_id_str in vip:
-        del vip[user_id_str]
-        save_vip(vip)
-        return "✅ VIP статус снят"
-    return "❌ У этого пользователя нет VIP"
-
-def show_stats():
-    vip = load_vip()
-    stats = load_stats()
-    mails = load_mails()
-    text = "📊 <b>СТАТИСТИКА</b>\n\n"
-    text += f"👥 Пользователей: {len(mails)}\n"
-    text += f"⭐ VIP: {len(vip)}\n"
-    if vip:
-        text += "\n<b>VIP список:</b>\n"
-        for uid in vip:
-            user_mail = mails.get(uid, {}).get('email', 'нет почты')
-            text += f"• {uid} - {user_mail}\n"
-    return text
-
-def handle_command(user_id, cmd, args):
-    limit_commands = ['/inbox', '/read', '/code']
-    if cmd in limit_commands:
-        can_use, _ = check_limit(user_id)
-        if not can_use:
-            remaining = get_remaining(user_id)
-            return (f"❌ <b>Лимит исчерпан!</b>\n\n"
-                   f"У тебя бесплатный тариф: 2 письма в день.\n"
-                   f"Осталось сегодня: {remaining}\n\n"
-                   f"⭐ Купи VIP: /subscription")
-    
-    if cmd in ['/start', '/help']:
-        vip_status = "⭐ VIP" if is_vip(user_id) else "🆓 Free"
-        remaining = get_remaining(user_id)
-        return (f"📧 <b>Временная почта</b>\n\n"
-               f"Твой статус: {vip_status}\n"
-               f"Писем сегодня: {remaining}\n\n"
-               "<b>Команды:</b>\n"
-               "/new - Создать ящик\n"
-               "/login email пароль - Войти\n"
-               "/inbox - Список писем\n"
-               "/read N - Прочитать\n"
-               "/code - Ждать код\n"
-               "/status - Информация\n"
-               "/delete - Удалить всё\n"
-               "/subscription - Купить VIP\n\n"
-               f"👑 Админ: @{ADMIN_USERNAME}")
-    
-    elif cmd == "/subscription":
-        return ("⭐ <b>VIP ПОДПИСКА</b>\n\n"
-               "<b>Преимущества:</b>\n"
-               "• Безлимит писем\n"
-               "• Приоритет\n\n"
-               f"💰 Цена: 100₽/месяц\n\n"
-               f"📩 Купить: @{ADMIN_USERNAME}")
-    
-    elif cmd == "/new":
-        email, pwd, token = create_account(user_id)
-        if email:
-            return (f"✅ <b>Ящик создан!</b>\n\n"
-                   f"📧 <code>{email}</code>\n"
-                   f"🔑 <code>{pwd}</code>\n\n"
-                   f"⭐ Статус: {'VIP' if is_vip(user_id) else 'Free'}")
-        return "❌ Ошибка"
-    
-    elif cmd == "/login":
-        if len(args) < 2:
-            return "❌ /login email пароль"
-        token = login_to_mail(user_id, args[0], args[1])
-        if token:
-            return f"✅ Вход: {args[0]}"
-        return "❌ Ошибка"
-    
-    elif cmd == "/status":
-        mail_data = get_user_mail(user_id)
-        if not mail_data:
-            return "❌ Нет ящика. /new"
-        msgs = get_messages(mail_data['token'])
-        vip_status = "VIP" if is_vip(user_id) else "Free"
-        remaining = get_remaining(user_id)
-        return (f"📊 <b>Статус</b>\n\n"
-               f"📧 {mail_data['email']}\n"
-               f"📬 Писем: {len(msgs)}\n"
-               f"⭐ {vip_status}\n"
-               f"📅 Осталось: {remaining}")
-    
-    elif cmd == "/inbox":
-        mail_data = get_user_mail(user_id)
-        if not mail_data:
-            return "❌ /new"
-        msgs = get_messages(mail_data['token'])
-        if not msgs:
-            return "📭 Нет писем"
-        increment_usage(user_id)
-        result = f"📬 <b>{len(msgs)} писем</b>\n\n"
-        for i, m in enumerate(msgs[:10], 1):
-            subj = m.get('subject', '(без темы)')[:40]
-            result += f"{i}. {subj}\n"
-        if len(msgs) > 10:
-            result += f"\n... ещё {len(msgs)-10}"
-        result += "\n\n/read N"
-        return result
-    
-    elif cmd == "/read":
-        if not args:
-            return "❌ /read 1"
-        mail_data = get_user_mail(user_id)
-        if not mail_data:
-            return "❌ /new"
-        try:
-            num = int(args[0]) - 1
-            msgs = get_messages(mail_data['token'])
-            if num < 0 or num >= len(msgs):
-                return "❌ Неверно"
-            increment_usage(user_id)
-            msg = read_message(mail_data['token'], msgs[num]['id'])
-            if not msg:
-                return "❌ Ошибка"
-            subject = msg.get('subject', '(без темы)')
-            from_addr = msg.get('from', {}).get('address', '?')
-            text = msg.get('text', '')[:1000]
-            codes = extract_codes(text)
-            result = f"📨 <b>{subject}</b>\n\n📬 {from_addr}\n\n📄 {text}"
-            if codes:
-                result += f"\n\n🔑 <b>КОД: {codes[0]}</b>"
-            return result
-        except:
-            return "❌ Ошибка"
-    
-    elif cmd == "/code":
-        mail_data = get_user_mail(user_id)
-        if not mail_data:
-            return "❌ /new"
-        seen = set()
-        for _ in range(20):
-            msgs = get_messages(mail_data['token'])
-            for m in msgs:
-                if m['id'] not in seen:
-                    seen.add(m['id'])
-                    full = read_message(mail_data['token'], m['id'])
-                    if full:
-                        codes = extract_codes(full.get('text', ''))
-                        if codes:
-                            increment_usage(user_id)
-                            return f"🔑 <b>КОД: {codes[0]}</b>"
-            time.sleep(3)
-        return "⏰ Код не пришёл"
-    
-    elif cmd == "/delete":
-        mail_data = get_user_mail(user_id)
-        if not mail_data:
-            return "❌ Нет ящика"
-        count = delete_all_messages(mail_data['token'])
-        return f"🗑️ Удалено {count} писем"
-    
-    elif cmd == "/admin" and is_admin(user_id):
-        return ("👑 <b>АДМИН ПАНЕЛЬ</b>\n\n"
-               "/stats - Статистика\n"
-               "/givevip ID дни - Выдать VIP\n"
-               "/removevip ID - Снять VIP\n"
-               "/broadcast текст - Рассылка")
-    
-    elif cmd == "/stats" and is_admin(user_id):
-        return show_stats()
-    
-    elif cmd == "/givevip" and is_admin(user_id):
-        if len(args) < 2:
-            return "❌ /givevip 123456789 30"
-        try:
-            target_id = args[0]
-            days = int(args[1])
-            result = give_vip(target_id, days)
-            send_telegram(target_id, f"🎉 <b>Тебе выдан VIP на {days} дней!</b>\n\nБезлимит писем активирован.")
-            return result
-        except:
-            return "❌ Ошибка"
-    
-    elif cmd == "/removevip" and is_admin(user_id):
-        if not args:
-            return "❌ /removevip ID"
-        result = remove_vip(args[0])
-        send_telegram(args[0], f"❌ <b>VIP статус снят</b>\n\nТеперь 2 письма в день.")
-        return result
-    
-    elif cmd == "/broadcast" and is_admin(user_id):
-        if not args:
-            return "❌ /broadcast текст"
-        text = ' '.join(args)
-        mails = load_mails()
-        sent = 0
-        for uid in mails:
-            try:
-                send_telegram(uid, f"📢 <b>РАССЫЛКА</b>\n\n{text}")
-                sent += 1
-                time.sleep(0.1)
-            except:
-                pass
-        return f"✅ Отправлено {sent} пользователям"
-    
-    return None
-
-def main():
-    print("🤖 БОТ ЗАПУЩЕН!")
-    print(f"👑 Админ ID: {ADMIN_ID}")
-    
-    last_update_id = 0
-    processed_ids = load_processed()
-    
-    while True:
-        try:
-            updates = get_updates(last_update_id + 1 if last_update_id else None)
-            for update in updates:
-                update_id = update['update_id']
-                if str(update_id) in processed_ids:
-                    continue
-                processed_ids.add(str(update_id))
-                save_processed(update_id)
-                last_update_id = update_id
-                if 'message' in update:
-                    msg = update['message']
-                    user_id = str(msg['from']['id'])
-                    text = msg.get('text', '')
-                    if text:
-                        parts = text.split()
-                        cmd = parts[0].lower()
-                        args = parts[1:] if len(parts) > 1 else []
-                        response = handle_command(user_id, cmd, args)
-                        if response:
-                            send_telegram(user_id, response)
-            time.sleep(1)
-        except Exception as e:
-            print(f"Ошибка: {e}")
-            time.sleep(5)
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('setadmin', set_admin))
+    application.add_handler(CommandHandler('setvip', set_vip))
+    application.add_handler(CommandHandler('setgod', set_god))
+    application.add_handler(CommandHandler('delete', delete_sub))
+    application.add_handler(CommandHandler('ban', ban_user))
+    application.add_handler(CommandHandler('unban', unban_user))
+    application.add_handler(CommandHandler('give', give_reqs))
+    application.add_handler(CommandHandler('gives', gives_reqs))
+    application.add_handler(CommandHandler('list', list_commands))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    print("SaaS-BOT V3.0 PERFECT EDITION STARTED!")
+    application.run_polling()
