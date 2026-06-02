@@ -1,2 +1,7 @@
 requests
 python-telegram-bot
+asyncio
+datetime
+timedelta
+logging
+sys
